@@ -1,0 +1,21 @@
+# MOSDAC Configuration
+
+# The following settings are used for configuring the MOSDAC application.
+
+# API credentials
+api:
+  key: YOUR_API_KEY_HERE
+  secret: YOUR_API_SECRET_HERE
+
+# Database settings
+database:
+  host: localhost
+  port: 5432
+  name: mosdac_db
+  user: db_user
+  password: db_password
+
+# Other settings
+other:
+  logging_level: debug
+  timeout: 30
