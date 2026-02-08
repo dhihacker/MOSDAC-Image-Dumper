@@ -1,38 +1,484 @@
+name: MOSDAC Image Downloader
 
-## ⚙️ Usage
+on:
+  schedule:
+    # Run every 30 minutes
+    - cron: '*/30 * * * *'
+  # Run on push to main branch
+  push:
+    branches: [ main, master ]
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      download_all:
+        description: 'Download all historical data (last 7 days)'
+        required: false
+        default: 'false'
+        type: boolean
+      satellite:
+        description: 'Specific satellite to download (leave empty for all)'
+        required: false
+        default: ''
+        type: string
 
-### Manual Trigger
-You can manually trigger a download from the GitHub Actions tab:
-1. Go to **Actions** → **MOSDAC Image Downloader**
-2. Click **Run workflow**
-3. Choose options:
-   - **download_all**: Download last 7 days (vs last 1 day)
-   - **satellite**: Download specific satellite only
+env:
+  PYTHON_VERSION: '3.10'
+  MAX_GIT_PUSH_SIZE: '100MB'
 
-### Scheduled Runs
-The workflow runs automatically every 30 minutes to fetch the latest images.
-
-## 🔧 Configuration
-Edit `config.yaml` to customize:
-- Download frequency
-- Storage organization
-- Satellite/sensor filters
-- Number of concurrent downloads
-
-## 📈 Recent Activity
+jobs:
+  download-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+    - name: Checkout repository with full history
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Get all history for proper git diff
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests PyYAML schedule python-dateutil tqdm aiohttp asyncio
+    
+    - name: Create default config if not exists
+      run: |
+        if [ ! -f "config.yaml" ]; then
+          cat > config.yaml << 'EOF'
+mosdac:
+  base_url: "https://mosdac.gov.in"
+  product_json_url: "https://mosdac.gov.in/gallery/product.json?v=0.24"
+  api_endpoint: "https://mosdac.gov.in/gallery/getImage.php"
+  
+download:
+  count_per_request: 8
+  lookback_days: 1  # Only get last day for scheduled runs
+  max_concurrent: 5
+  save_previews: true
+  
+storage:
+  base_dir: "images"
+  organize_by:
+    - satellite
+    - sensor
+    - product_type
+    - date
+  
+scheduler:
+  interval_minutes: 30
+  max_runtime: 25
+  
+filters:
+  satellites: []
+  sensors: []
+  product_types: []
+  
+log:
+  level: "INFO"
+  file: "mosdac_downloader.log"
+  max_size_mb: 10
 EOF
+        fi
+    
+    - name: Configure download parameters
+      id: configure
+      run: |
+        # Handle manual trigger inputs
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ github.event.inputs.download_all }}" == "true" ]]; then
+            echo "Setting lookback to 7 days"
+            python -c "
+import yaml
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+config['download']['lookback_days'] = 7
+with open('config.yaml', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+"
+          fi
+          
+          if [[ -n "${{ github.event.inputs.satellite }}" ]]; then
+            echo "Setting satellite filter"
+            python -c "
+import yaml
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+config['filters']['satellites'] = ['${{ github.event.inputs.satellite }}']
+with open('config.yaml', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+"
+          fi
+        fi
         
-        # Add recent commits
-        echo "" >> README.md
-        echo "### Recent Updates" >> README.md
-        echo "" >> README.md
-        git log --oneline -n 5 -- images/ 2>/dev/null | sed 's/^/- /' >> README.md 2>/dev/null || echo "- No recent commits" >> README.md
+        # For scheduled runs, use minimal lookback
+        if [[ "${{ github.event_name }}" == "schedule" ]]; then
+          echo "Setting lookback to 1 day for scheduled run"
+          python -c "
+import yaml
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+config['download']['lookback_days'] = 1
+with open('config.yaml', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+"
+        fi
+    
+    - name: Create Python script
+      run: |
+        cat > download_latest.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Quick download script for GitHub Actions
+"""
+import asyncio
+import aiohttp
+import aiofiles
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import urljoin
+import sys
+import yaml
+
+class QuickDownloader:
+    def __init__(self):
+        with open('config.yaml', 'r') as f:
+            self.config = yaml.safe_load(f)
         
-        echo "" >> README.md
-        echo "---" >> README.md
-        echo "*Generated automatically by GitHub Actions*" >> README.md
+        self.base_url = self.config['mosdac']['base_url']
+        self.product_json_url = self.config['mosdac']['product_json_url']
+        self.api_endpoint = self.config['mosdac']['api_endpoint']
         
-        # Commit README update
-        git add README.md
-        git diff --cached --quiet || git commit -m "📝 Update README with latest stats"
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Create base directory
+        self.base_dir = Path(self.config['storage']['base_dir'])
+        self.base_dir.mkdir(exist_ok=True)
+    
+    async def fetch_product_catalog(self):
+        """Fetch product catalog"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.product_json_url) as response:
+                    if response.status == 200:
+                        return await response.json()
+        except Exception as e:
+            self.logger.error(f"Failed to fetch catalog: {e}")
+        return []
+    
+    async def get_image_list(self, pattern: str, date_str: str):
+        """Get image list for pattern and date"""
+        payload = {
+            "prod": pattern,
+            "st_date": date_str,
+            "count": str(self.config['download']['count_per_request'])
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json;charset=UTF-8',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                async with session.post(
+                    self.api_endpoint,
+                    json=payload,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if isinstance(result, list) and len(result) > 0:
+                            image_list_str = result[0]
+                            if image_list_str:
+                                images = image_list_str.split(',')
+                                return [img.strip().strip('"').strip("'") for img in images if img.strip()]
+        except Exception as e:
+            self.logger.error(f"Error getting image list: {e}")
+        
+        return []
+    
+    async def download_image(self, session, image_path, save_path):
+        """Download single image"""
+        image_url = urljoin(self.base_url, f"/look/{image_path}")
+        
+        try:
+            async with session.get(image_url) as response:
+                if response.status == 200:
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    async with aiofiles.open(save_path, 'wb') as f:
+                        await f.write(await response.read())
+                    
+                    self.logger.info(f"✓ Downloaded: {save_path.name}")
+                    return True
+        except Exception as e:
+            self.logger.error(f"✗ Failed: {image_url} - {e}")
+        
+        return False
+    
+    def get_save_path(self, image_path, satellite, sensor, product_type):
+        """Generate save path"""
+        parts = image_path.split('/')
+        
+        # Extract date from path
+        date_parts = []
+        for part in parts:
+            if part.isdigit() and len(part) == 4:
+                date_parts.append(part)
+            elif len(part) == 5 and part[:2].isdigit() and part[2:].isalpha():
+                date_parts.append(part)
+        
+        # Build path
+        path_parts = [self.base_dir]
+        
+        for org in self.config['storage']['organize_by']:
+            if org == 'satellite':
+                path_parts.append(satellite.replace('/', '_'))
+            elif org == 'sensor':
+                path_parts.append(sensor.replace('/', '_'))
+            elif org == 'product_type':
+                path_parts.append(product_type.replace('/', '_'))
+            elif org == 'date' and date_parts:
+                path_parts.extend(date_parts)
+        
+        filename = parts[-1] if parts else f"image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        path_parts.append(filename)
+        
+        return Path(*path_parts)
+    
+    async def download_all(self):
+        """Main download function"""
+        catalog = await self.fetch_product_catalog()
+        if not catalog:
+            self.logger.error("No catalog available")
+            return
+        
+        # Calculate date range
+        lookback = self.config['download']['lookback_days']
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback)
+        
+        date_strings = []
+        current = start_date
+        while current <= end_date:
+            date_strings.append(current.strftime('%Y-%m-%d'))
+            current += timedelta(days=1)
+        
+        # Apply filters
+        satellites_filter = self.config['filters']['satellites']
+        sensors_filter = self.config['filters']['sensors']
+        product_types_filter = self.config['filters']['product_types']
+        
+        semaphore = asyncio.Semaphore(self.config['download']['max_concurrent'])
+        
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            total_images = 0
+            
+            for satellite_data in catalog:
+                satellite_name = satellite_data['sat']
+                
+                if satellites_filter and satellite_name not in satellites_filter:
+                    continue
+                
+                for sensor_data in satellite_data['sensor']:
+                    sensor_name = sensor_data['sen']
+                    
+                    if sensors_filter and sensor_name not in sensors_filter:
+                        continue
+                    
+                    for type_data in sensor_data['type']:
+                        product_type = type_data['prodt']
+                        
+                        if product_types_filter and product_type not in product_types_filter:
+                            continue
+                        
+                        for product in type_data['prodlist']:
+                            pattern = product['pat']
+                            product_name = product['prod']
+                            
+                            self.logger.info(f"Checking: {satellite_name}/{sensor_name}/{product_name}")
+                            
+                            for date_str in date_strings:
+                                image_list = await self.get_image_list(pattern, date_str)
+                                total_images += len(image_list)
+                                
+                                for image_path in image_list:
+                                    save_path = self.get_save_path(
+                                        image_path, satellite_name, 
+                                        sensor_name, product_type
+                                    )
+                                    
+                                    if save_path.exists():
+                                        continue
+                                    
+                                    async def download_with_sem(img_path, s_path):
+                                        async with semaphore:
+                                            return await self.download_image(session, img_path, s_path)
+                                    
+                                    tasks.append(download_with_sem(image_path, save_path))
+            
+            self.logger.info(f"Found {total_images} images, {len(tasks)} new to download")
+            
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                successful = sum(1 for r in results if r is True)
+                failed = sum(1 for r in results if r is False)
+                
+                self.logger.info(f"Download complete: {successful} successful, {failed} failed")
+                return successful > 0  # Return True if any downloads succeeded
+            else:
+                self.logger.info("No new images to download")
+                return False
+
+async def main():
+    downloader = QuickDownloader()
+    return await downloader.download_all()
+
+if __name__ == "__main__":
+    success = asyncio.run(main())
+    sys.exit(0 if success else 1)
+EOF
+    
+    - name: Run downloader
+      id: download
+      run: |
+        echo "Starting download at $(date)"
+        python download_latest.py
+        if [ $? -eq 0 ]; then
+          echo "success=true" >> $GITHUB_OUTPUT
+        else
+          echo "success=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Check if any files were downloaded
+      id: check-files
+      run: |
+        # Count new image files
+        NEW_IMAGES=$(find images/ -name "*.jpg" -newer .github/workflows/main.yml 2>/dev/null | wc -l || echo "0")
+        TOTAL_IMAGES=$(find images/ -name "*.jpg" | wc -l || echo "0")
+        
+        echo "New images: $NEW_IMAGES"
+        echo "Total images: $TOTAL_IMAGES"
+        
+        echo "new_images=$NEW_IMAGES" >> $GITHUB_OUTPUT
+        echo "total_images=$TOTAL_IMAGES" >> $GITHUB_OUTPUT
+        
+        # Check if we should commit
+        if [ "$NEW_IMAGES" -gt 0 ]; then
+          echo "should_commit=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_commit=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Configure Git
+      if: steps.check-files.outputs.should_commit == 'true'
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+    
+    - name: Commit and push changes
+      if: steps.check-files.outputs.should_commit == 'true'
+      run: |
+        # Add only image files to avoid committing logs/configs
+        find images/ -name "*.jpg" -exec git add {} \;
+        find images/ -name "*.json" -exec git add {} \;
+        
+        # Create commit message
+        COMMIT_MSG="📡 Update satellite images
+        
+        • Downloaded ${{ steps.check-files.outputs.new_images }} new images
+        • Total images: ${{ steps.check-files.outputs.total_images }}
+        • Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        
+        Triggered by: ${{ github.event_name }}
+        Run: ${{ github.run_id }}"
+        
+        # Commit if there are changes
+        git diff --cached --quiet || git commit -m "$COMMIT_MSG"
+        
+        # Push changes
         git push
+    
+    - name: Create summary report
+      if: always()
+      run: |
+        echo "# Download Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Run Information**" >> $GITHUB_STEP_SUMMARY
+        echo "- Trigger: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "- Run ID: \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "**Download Results**" >> $GITHUB_STEP_SUMMARY
+        echo "- New images downloaded: **${{ steps.check-files.outputs.new_images }}**" >> $GITHUB_STEP_SUMMARY
+        echo "- Total images in repository: **${{ steps.check-files.outputs.total_images }}**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ steps.check-files.outputs.should_commit }}" == "true" ]]; then
+          echo "✅ Changes committed and pushed to repository" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⏸️ No new images to commit" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        # Show recent files if any were downloaded
+        if [[ "${{ steps.check-files.outputs.new_images }}" -gt 0 ]]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Recently Downloaded Files**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          find images/ -name "*.jpg" -newer .github/workflows/main.yml 2>/dev/null | head -10 | xargs -I {} basename {} >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No new files found" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "*[View repository](https://github.com/${{ github.repository }})*" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Cleanup old files (optional)
+      if: steps.check-files.outputs.total_images > 1000
+      run: |
+        echo "Cleaning up files older than 30 days..."
+        find images/ -name "*.jpg" -type f -mtime +30 -delete
+        find images/ -name "*.json" -type f -mtime +30 -delete
+        
+        # Count remaining
+        REMAINING=$(find images/ -name "*.jpg" | wc -l)
+        echo "Remaining images: $REMAINING"
+    
+    - name: Update README with stats
+      if: always()
+      run: |
+        # Create or update README.md with download stats
+        cat > README.md << 'EOF'
+# 🛰️ MOSDAC Satellite Image Archive
+
+Automated archive of satellite images from [MOSDAC.gov.in](https://mosdac.gov.in).
+
+## 📊 Statistics
+- **Total Images**: ${{ steps.check-files.outputs.total_images }}
+- **Last Updated**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+- **Last Run**: ${{ github.event_name }} ([#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}))
+
+## 🚀 Features
+- Automatic downloads every 30 minutes
+- Organized by satellite/sensor/type/date
+- Manual trigger support
+- Download history tracking
+
+## 📁 Directory Structure
