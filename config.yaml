@@ -1,21 +1,44 @@
-# MOSDAC Configuration
-
-# The following settings are used for configuring the MOSDAC application.
-
-# API credentials
-api:
-  key: YOUR_API_KEY_HERE
-  secret: YOUR_API_SECRET_HERE
-
-# Database settings
-database:
-  host: localhost
-  port: 5432
-  name: mosdac_db
-  user: db_user
-  password: db_password
-
-# Other settings
-other:
-  logging_level: debug
-  timeout: 30
+mosdac:
+  base_url: "https://mosdac.gov.in"
+  product_json_url: "https://mosdac.gov.in/gallery/product.json?v=0.24"
+  api_endpoint: "https://mosdac.gov.in/gallery/getImage.php"
+  
+download:
+  # How many images to fetch per request
+  count_per_request: 8
+  # Days to look back for images
+  lookback_days: 7
+  # Max concurrent downloads
+  max_concurrent: 5
+  # Save preview images
+  save_previews: true
+  
+storage:
+  base_dir: "images"
+  organize_by:
+    - satellite
+    - sensor
+    - product_type
+    - date
+  
+scheduler:
+  # Run every 30 minutes
+  interval_minutes: 30
+  # Maximum runtime per execution (minutes)
+  max_runtime: 25
+  
+github:
+  # GitHub Pages deployment
+  enable_gh_pages: false
+  gh_pages_branch: "gh-pages"
+  
+# Filter specific satellites/sensors
+filters:
+  satellites: []  # Empty = all satellites
+  sensors: []     # Empty = all sensors
+  product_types: []  # Empty = all product types
+  
+log:
+  level: "INFO"
+  file: "mosdac_downloader.log"
+  max_size_mb: 10
