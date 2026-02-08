@@ -1,0 +1,38 @@
+
+## ⚙️ Usage
+
+### Manual Trigger
+You can manually trigger a download from the GitHub Actions tab:
+1. Go to **Actions** → **MOSDAC Image Downloader**
+2. Click **Run workflow**
+3. Choose options:
+   - **download_all**: Download last 7 days (vs last 1 day)
+   - **satellite**: Download specific satellite only
+
+### Scheduled Runs
+The workflow runs automatically every 30 minutes to fetch the latest images.
+
+## 🔧 Configuration
+Edit `config.yaml` to customize:
+- Download frequency
+- Storage organization
+- Satellite/sensor filters
+- Number of concurrent downloads
+
+## 📈 Recent Activity
+EOF
+        
+        # Add recent commits
+        echo "" >> README.md
+        echo "### Recent Updates" >> README.md
+        echo "" >> README.md
+        git log --oneline -n 5 -- images/ 2>/dev/null | sed 's/^/- /' >> README.md 2>/dev/null || echo "- No recent commits" >> README.md
+        
+        echo "" >> README.md
+        echo "---" >> README.md
+        echo "*Generated automatically by GitHub Actions*" >> README.md
+        
+        # Commit README update
+        git add README.md
+        git diff --cached --quiet || git commit -m "📝 Update README with latest stats"
+        git push
