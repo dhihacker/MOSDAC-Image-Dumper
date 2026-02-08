@@ -1,0 +1,7 @@
+requests
+PyYAML
+schedule
+python-dateutil
+tqdm
+aiohttp
+aiofiles
